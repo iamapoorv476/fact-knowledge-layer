@@ -231,6 +231,7 @@ _MODIFIER_TOKENS = {
     "proforma", "pro", "forma", "underlying", "excluding", "including", "incl",
     "excl", "annualised", "annualized", "average", "estimated", "projected",
     "provisional", "revised", "budgeted", "actual", "current", "noncurrent",
+    "other", "others",
 }
 _ATTRIBUTE_STOPWORDS = {
     "the", "a", "an", "of", "from", "for", "in", "on", "at", "to", "and", "or",
@@ -368,6 +369,21 @@ def _qualifier_delta(a: AtomicFact, b: AtomicFact) -> Dict[str, List[Optional[st
     return delta
 
 
+#: Line-item labels so generic that the word alone identifies nothing. Every
+#: financial statement has an "Others" bucket, and different statements' "Others"
+#: buckets are essentially never the same thing — one document's residual
+#: revenue category and another's residual segment profit share nothing but
+#: the label. This list is domain-agnostic: it names common statement-line
+#: vocabulary, not anything specific to logistics, India, or this corpus.
+_GENERIC_LABEL_CORES = {
+    "others", "other", "total", "totals", "net", "gross", "balance",
+    "miscellaneous", "sundry", "various", "change", "movement", "movements",
+    "adjustment", "adjustments", "remaining", "reconciliation", "difference",
+    "subtotal", "provision", "provisions", "reserve", "reserves", "addition",
+    "additions", "deduction", "deductions", "general", "misc",
+}
+
+
 class PairClassifier:
     """Decides the relationship between two facts that share entity and attribute."""
 
@@ -379,6 +395,52 @@ class PairClassifier:
     ) -> None:
         self.profiles = profiles or {}
         self.core_similarity_threshold = core_similarity_threshold
+
+    def _generic_label_mismatch(
+        self,
+        signature_a: "AttributeSignature",
+        signature_b: "AttributeSignature",
+        a: AtomicFact,
+        b: AtomicFact,
+    ) -> Optional[Verdict]:
+        """Refuse to compare a bare generic label unless context confirms it.
+
+        "Others = 101.9" and "Others = 1" pass every other check — same entity,
+        same core, same period — yet come from a revenue note and a segment
+        profit table that have nothing to do with each other. The label alone
+        cannot tell them apart, so this requires the disambiguating context
+        qualifier to be present on *both* sides and to actually correspond
+        before treating them as the same measure. Missing or differing context
+        is grounds to decline the comparison, not to assume a match.
+        """
+        core_a = normalize_key(a.attribute)
+        core_b = normalize_key(b.attribute)
+        if core_a not in _GENERIC_LABEL_CORES and core_b not in _GENERIC_LABEL_CORES:
+            return None
+
+        context_a = a.qualifiers.get("context") or a.qualifiers.get("section")
+        context_b = b.qualifiers.get("context") or b.qualifiers.get("section")
+        if context_a and context_b:
+            key_a, key_b = normalize_key(context_a), normalize_key(context_b)
+            if key_a == key_b or key_a in key_b or key_b in key_a:
+                return None  # contexts agree — safe to let normal comparison proceed
+            return Verdict(
+                RelationshipType.ORTHOGONAL,
+                f"Both use the generic label '{a.attribute}', but come from different "
+                f"contexts ({context_a!r} vs {context_b!r}) — almost certainly unrelated "
+                f"line items that happen to share a name, not the same measure.",
+                {"dimension": "attribute", "reason": "generic label, mismatched context"},
+                confidence=0.7,
+            )
+
+        return Verdict(
+            RelationshipType.ORTHOGONAL,
+            f"'{a.attribute}' is too generic a label to compare without knowing which "
+            f"line item it refers to on both sides, and at least one side's surrounding "
+            f"context wasn't captured — treating as unrelated rather than guessing.",
+            {"dimension": "attribute", "reason": "generic label, context unavailable"},
+            confidence=0.4,
+        )
 
     def classify(self, a: AtomicFact, b: AtomicFact) -> Verdict:
         signature_a = attribute_signature(a.attribute)
@@ -394,6 +456,10 @@ class PairClassifier:
                 {"dimension": "attribute", "core_similarity": round(similarity, 2)},
                 confidence=0.5,
             )
+
+        generic_block = self._generic_label_mismatch(signature_a, signature_b, a, b)
+        if generic_block is not None:
+            return generic_block
 
         quantity_a, quantity_b = _quantity_of(a), _quantity_of(b)
         if quantity_a is None or quantity_b is None:

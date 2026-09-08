@@ -434,8 +434,20 @@ def _clean_label(text: str) -> str:
     """Strip list markers, footnote markers and trailing punctuation from a label."""
     cleaned = collapse_whitespace(text)
     cleaned = _LIST_MARKER_RE.sub("", cleaned)
-    cleaned = re.sub(r"\s*\(\d{1,2}(?:,\d{1,2})*\)\s*$", "", cleaned)  # "(1)", "(1,2)"
-    cleaned = re.sub(r"[*†‡#]+\s*$", "", cleaned)
+    # A label can carry more than one stacked trailing marker — a footnote
+    # digit followed by a bookkeeping letter ("...year(3) (B)") — so strip
+    # repeatedly until nothing more comes off, not once per marker type.
+    while True:
+        before = cleaned
+        cleaned = re.sub(r"\s*\(\d{1,2}(?:,\d{1,2})*\)\s*$", "", cleaned)  # "(1)", "(1,2)"
+        # "(B)", "(A+B)" — bookkeeping references to another row/column in the
+        # same reconciliation table. Restricted to single letters optionally
+        # joined by +/- so a real multi-letter acronym like "(FX)" or "(CAD)"
+        # is never touched.
+        cleaned = re.sub(r"\s*\((?:[A-Z](?:[+\-][A-Z])*)\)\s*$", "", cleaned)
+        cleaned = re.sub(r"[*†‡#]+\s*$", "", cleaned)
+        if cleaned == before:
+            break
     cleaned = cleaned.rstrip(" :;.")
     return collapse_whitespace(cleaned)
 
