@@ -412,9 +412,28 @@ def _value_kind(unit: Optional[UnitSpec]) -> ValueKind:
     }.get(unit.dimension, ValueKind.NUMBER)
 
 
+#: A leading list-numbering marker on a table row label: "I. Total ...",
+#: "(ii) Private", "A. Government", "1. Others", or a compound hierarchical
+#: form like "II.1 Manufacturing", "II.a. Infrastructure", "II.5.8 New
+#: issuances...". Common in national-accounts and budget-style tables that
+#: number their row categories through several levels. The marker carries no
+#: measurement meaning, so it is dropped rather than treated as part of the
+#: attribute's name.
+_LIST_MARKER_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"\((?:[ivxlcdm]{1,4}|[a-z]|\d{1,3})\)"
+    r"|"
+    r"(?:[IVXLCDM]{1,4}|[A-Za-z]|\d{1,3})(?:\.(?:\d{1,3}|[a-z]))*\.?"
+    r")"
+    r"\s+(?=[A-Za-z])"
+)
+
+
 def _clean_label(text: str) -> str:
-    """Strip footnote markers and trailing punctuation from a row/attribute label."""
+    """Strip list markers, footnote markers and trailing punctuation from a label."""
     cleaned = collapse_whitespace(text)
+    cleaned = _LIST_MARKER_RE.sub("", cleaned)
     cleaned = re.sub(r"\s*\(\d{1,2}(?:,\d{1,2})*\)\s*$", "", cleaned)  # "(1)", "(1,2)"
     cleaned = re.sub(r"[*†‡#]+\s*$", "", cleaned)
     cleaned = cleaned.rstrip(" :;.")
@@ -511,20 +530,67 @@ _CAPITALISED_TOKEN_RE = re.compile(r"\b([A-Z][a-zA-Z]{2,})\b")
 
 _GENERIC_ORG_PREFIXES = ("our ", "the ", "this ", "such ", "its ", "a ", "an ")
 
+#: Signals used by institutional "country report" style documents, where the
+#: publisher (IMF, World Bank, OECD, ...) is explicitly not the subject — the
+#: country is. None of these patterns name any specific country; they match
+#: the structural convention such reports use to state their subject.
+_COUNTRY_REPORT_LABEL_RE = re.compile(r"Country\s+Report\b", re.I)
+_STANDALONE_CAPS_LINE_RE = re.compile(r"^[ \t]*([A-Z][A-Z\s]{2,40})[ \t]*$", re.M)
+_TITLE_FOR_COUNTRY_RE = re.compile(
+    r"\bFOR\s+(?:THE\s+)?([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b\.?\s*$", re.M
+)
+
+
+def _country_report_subject(document: ParsedDocument) -> Optional[str]:
+    """Detect the "this is a report about X, published by Y" pattern.
+
+    IMF/World Bank/OECD-style country reports state their subject two ways
+    near the top, independent of each other: a short, standalone all-caps line
+    right after the report's own label ("IMF Country Report No. 25/314" /
+    "INDIA"), and a title ending "...FOR <COUNTRY>" or "...FOR THE <COUNTRY>".
+    When either fires, it overrides the publisher-name heuristic below, which
+    would otherwise report the institution that wrote the document rather than
+    the country the document is about.
+    """
+    front = "\n".join(page.text for page in document.pages[:3])
+    label_match = _COUNTRY_REPORT_LABEL_RE.search(front)
+    if label_match is None:
+        return None
+
+    window = front[label_match.end() : label_match.end() + 200]
+    caps_match = _STANDALONE_CAPS_LINE_RE.search(window)
+    if caps_match:
+        candidate = collapse_whitespace(caps_match.group(1))
+        if 2 <= len(candidate) <= 40 and candidate.casefold() not in _SUBJECT_STOPWORDS:
+            return candidate.title()
+
+    for match in _TITLE_FOR_COUNTRY_RE.finditer(front):
+        candidate = collapse_whitespace(match.group(1))
+        if candidate.casefold() not in _SUBJECT_STOPWORDS:
+            return candidate
+
+    return None
+
 
 def infer_subject(document: ParsedDocument) -> str:
     """Guess the entity a document is primarily about.
 
-    Two passes. First, the most frequent distinctive proper noun across the
-    opening pages — "Delhivery" in the company filings, "India" in all three
-    institutional reports. Second, an organisation-shaped name containing that
-    noun, so "Delhivery" is promoted to "Delhivery Limited" while a macro report
-    about India is not mislabelled with whichever institution published it.
+    Three passes, in priority order. First, a structural "country report"
+    signal that catches the case where the publisher is explicitly not the
+    subject. Second, the most frequent distinctive proper noun across the
+    opening pages — "Delhivery" in the company filings, "India" in the
+    institutional reports that aren't country-report-labelled. Third, an
+    organisation-shaped name containing that noun, so "Delhivery" is promoted
+    to "Delhivery Limited".
 
     Getting this right matters more than it looks: the entity is half of the
     blocking key, so a document whose subject resolves differently from its peers
     can never corroborate or contradict them.
     """
+    country_report_subject = _country_report_subject(document)
+    if country_report_subject is not None:
+        return country_report_subject
+
     # Organisation names on the front pages are the strongest available signal:
     # a filing repeats its own legal name in the cover, the letterhead and the
     # signature block. Matched case-insensitively because covers are set in caps.
@@ -745,12 +811,24 @@ def parse_markdown_table(block: PageBlock) -> List[TableRow]:
 
 @dataclass(frozen=True)
 class TableHeader:
-    """Which columns of a table are periods, plus the table's unit."""
+    """Which columns of a table are periods, plus the table's unit.
+
+    ``value_columns`` is the column layout actually used for binding: every
+    column with a resolvable unit, mapped to the period it belongs to. For a
+    plain table this is identical to ``periods`` (one value column per period).
+    For a table that interleaves an absolute figure with a percentage under
+    one period — "(₹ in million) | % of revenue" repeated per year — it also
+    includes the percent columns, each carrying the period of the money column
+    to its left. Without that, a row scanner sees only as many "slots" as
+    ``periods`` has entries and binds a percentage into the next year's money
+    figure by mistake.
+    """
 
     row_index: int
     periods: Dict[int, ResolvedPeriod]
     unit: Optional[UnitSpec]
     skipped_columns: List[str]
+    value_columns: Dict[int, Tuple[ResolvedPeriod, Optional[UnitSpec]]] = field(default_factory=dict)
 
 
 def detect_table_header(
@@ -768,12 +846,19 @@ def detect_table_header(
         periods: Dict[int, ResolvedPeriod] = {}
         skipped: List[str] = []
         for column, cell in enumerate(row.cells):
-            if column == 0 or not cell.text:
+            if not cell.text:
                 continue
             resolved = resolver.resolve(cell.text, context=context)
             if resolved is not None:
                 periods[column] = resolved
-            else:
+            elif column != 0:
+                # Column 0 is normally the row-label corner and its failure to
+                # parse as a period is expected, not a skipped column. But some
+                # tables (IMF-style annexes) have no label column at all — every
+                # header cell, including the first, is a period. Only count a
+                # genuine skip when column 0 *isn't* one of those all-period
+                # headers, which the loop already handles by simply including
+                # it in ``periods`` whenever it does resolve.
                 skipped.append(cell.text)
         if len(periods) >= 2:
             corner = row.cells[0].text if row.cells else ""
@@ -793,7 +878,83 @@ def detect_table_header(
             # disambiguate them. Binding a value to "Q1" would silently pick one
             # of two different quarters, so the whole table is refused.
             return None
+        value_columns = _expand_value_columns(rows, best)
+        best = TableHeader(
+            row_index=best.row_index,
+            periods=best.periods,
+            unit=best.unit,
+            skipped_columns=best.skipped_columns,
+            value_columns=value_columns,
+        )
     return best
+
+
+def _expand_value_columns(
+    rows: Sequence[TableRow], header: TableHeader
+) -> Dict[int, Tuple[ResolvedPeriod, Optional[UnitSpec]]]:
+    """Map every value-bearing column to its period and its own unit.
+
+    Looks a few rows below the recognised period row for a per-column unit
+    declaration ("(₹ in million) | % of revenue ..."). When one exists, every
+    unit-bearing column is kept — not just the ones that carried period text —
+    and each is assigned the period of the nearest money-bearing column to its
+    left. When no such row exists (the ordinary case), this returns exactly
+    one slot per recognised period with no per-column unit override, which is
+    the same layout callers relied on before this function existed.
+    """
+    best_row: Optional[TableRow] = None
+    best_hits = 0
+    for row in rows[header.row_index + 1 : header.row_index + 5]:
+        if not row.cells:
+            continue
+        first = _clean_label(row.cells[0].text) if row.cells[0].text else ""
+        if first and _looks_like_label(first):
+            break  # real data has started; no further header rows to check
+        hits = sum(1 for cell in row.cells[1:] if cell.text and parse_unit(cell.text) is not None)
+        if hits > best_hits:
+            best_hits, best_row = hits, row
+
+    if best_row is None or best_hits < 2:
+        return {column: (period, None) for column, period in header.periods.items()}
+
+    # Assign each unit-bearing non-period column to the nearest period column
+    # to its left — but only within a short span, and never past the next
+    # period column. Without that bound, columns belonging to a period this
+    # table never resolved (a third header row this parser didn't capture)
+    # would silently inherit whatever period happened to be last recognised,
+    # producing several different values for one period instead of leaving
+    # that period unrecognised.
+    period_columns = sorted(header.periods)
+    max_gap = 2
+    value_columns: Dict[int, Tuple[ResolvedPeriod, Optional[UnitSpec]]] = {}
+    for column, cell in enumerate(best_row.cells):
+        if column in header.periods:
+            unit = parse_unit(cell.text) if cell.text else header.unit
+            value_columns[column] = (header.periods[column], unit)
+            continue
+        if not cell.text:
+            continue
+        unit = parse_unit(cell.text)
+        if unit is None:
+            continue
+        preceding = [p for p in period_columns if p < column]
+        if not preceding:
+            continue
+        nearest = max(preceding)
+        if column - nearest > max_gap:
+            continue
+        later = min((p for p in period_columns if p > nearest), default=None)
+        if later is not None and column >= later:
+            continue
+        value_columns[column] = (header.periods[nearest], unit)
+
+    # A period column whose own unit-row cell was blank (the currency is
+    # declared once and only the percent column repeats a label) still needs a
+    # slot, falling back to the table-level unit.
+    for column, period in header.periods.items():
+        value_columns.setdefault(column, (period, header.unit))
+
+    return value_columns
 
 
 def _qualify_with_year_row(
@@ -905,13 +1066,14 @@ class TableFactExtractor:
                         section = label  # a lone label row is a section heading
                     continue
 
-                for column, period in header.periods.items():
+                for column, (period, column_unit) in header.value_columns.items():
                     if column >= len(row.cells):
                         continue
                     cell = row.cells[column]
                     if not cell.text:
                         continue
-                    quantity = parse_quantity(cell.text, fallback_unit=table_unit)
+                    cell_unit = column_unit if column_unit is not None else table_unit
+                    quantity = parse_quantity(cell.text, fallback_unit=cell_unit)
                     if quantity is None:
                         if cell.text.strip() not in {"-", "–", "—", ""}:
                             stats["cells_unparsed"] += 1
@@ -933,6 +1095,8 @@ class TableFactExtractor:
                         qualifiers["context"] = heading
                     if period.refined:
                         qualifiers["period_inferred_from"] = "column date + 'year ended' context"
+                    if column_unit is not None and column_unit.dimension is Dimension.PERCENT:
+                        qualifiers["value_type"] = "share of total"
                     facts.append(
                         self._make_fact(
                             context, label, quantity, period, anchor, qualifiers, row.text, entity
@@ -1045,6 +1209,40 @@ class TableFactExtractor:
 # --------------------------------------------------------------------------- #
 # Orphan-row extraction (borderless statements)
 # --------------------------------------------------------------------------- #
+_BULLET_ARTIFACT_RE = re.compile(r"^[\x00-\x1f\x7f]?[A-Za-z\u2022\u25cf\u25aa\u00b7]?$")
+
+
+def _is_bullet_artifact(line: str) -> bool:
+    """A physical line that is just a stray bullet-glyph, not real text.
+
+    Some PDFs set bullet points in a symbol font whose glyph table maps the
+    bullet shape to an ordinary character — a lowercase "y", a bell control
+    character, a bare bullet dot. PyMuPDF extracts exactly what the font's
+    cmap says, so this is a real character in the text layer, not a parsing
+    error; it just is not part of any label and must not become one.
+    """
+    stripped = line.strip()
+    return len(stripped) <= 1 and bool(_BULLET_ARTIFACT_RE.match(stripped))
+
+
+def _trailing_scale_word(parts: Sequence[str]) -> Optional[UnitSpec]:
+    """True when the last folded label line is a bare scale word, not a name.
+
+    ``parse_unit("million")`` already resolves to a valid ``UnitSpec`` with
+    ``Dimension.UNKNOWN`` — a pure multiplier with no attached measure. That is
+    the signature of a stray unit declaration that line-wrapped onto its own
+    line ("Express parcel" / "million" / numbers...). A word carrying a real
+    dimension, like "days" in "Net Working Capital Days", must not be stripped
+    this way since there it is genuinely part of the measure's name.
+    """
+    if len(parts) < 2:
+        return None
+    candidate = parse_unit(parts[-1])
+    if candidate is not None and candidate.dimension is Dimension.UNKNOWN:
+        return candidate
+    return None
+
+
 def _looks_like_note_reference(quantity: Quantity) -> bool:
     raw = quantity.raw.strip()
     return "." not in raw and "," not in raw and abs(quantity.value) < 100
@@ -1082,11 +1280,31 @@ class OrphanRowExtractor:
             if header is None:
                 continue
             stats["orphan_blocks_scanned"] += 1
-            periods = [header.periods[key] for key in sorted(header.periods)]
-            unit = header.unit
-            if unit is None:
-                unit, _ = context.unit_context.resolve(page.page_number, classified.block.char_start)
-            facts.extend(self._scan_block(context, page, classified.block, periods, unit, stats))
+            columns = sorted(header.value_columns) if header.value_columns else sorted(header.periods)
+            periods = [
+                (header.value_columns[key][0] if header.value_columns else header.periods[key])
+                for key in columns
+            ]
+            column_units = [
+                (header.value_columns[key][1] if header.value_columns else None) for key in columns
+            ]
+            default_unit = header.unit
+            if default_unit is None:
+                resolved, source = context.unit_context.resolve(
+                    page.page_number, classified.block.char_start
+                )
+                # Same rule as the table and prose paths: a unit declared on
+                # this page can be inherited, a document-wide default cannot.
+                # Without this guard, a deck whose financial slides dominate
+                # the unit count (e.g. mostly "₹ Cr") leaks that currency onto
+                # an unrelated page of pure counts, like an operating-metrics
+                # table of gateways and sort centers.
+                default_unit = resolved if source.startswith("page-declaration") else None
+            facts.extend(
+                self._scan_block(
+                    context, page, classified.block, periods, default_unit, stats, column_units=column_units
+                )
+            )
         return self._drop_page_conflicts(facts, stats), stats
 
     @staticmethod
@@ -1102,9 +1320,16 @@ class OrphanRowExtractor:
         both would manufacture a contradiction out of an extraction failure, so
         both are dropped and counted.
         """
-        grouped: Dict[Tuple[str, Optional[str]], List[AtomicFact]] = {}
+        grouped: Dict[Tuple[str, Optional[str], str], List[AtomicFact]] = {}
         for fact in facts:
-            grouped.setdefault((fact.attribute_key, fact.temporal_scope), []).append(fact)
+            # value_kind is part of the key: a row legitimately printing both an
+            # absolute figure and its "% of revenue" under one label is not two
+            # conflicting claims about one number, it is two different measures
+            # that happen to share a label. Only same-kind values competing for
+            # one label and period are a real binding conflict.
+            grouped.setdefault(
+                (fact.attribute_key, fact.temporal_scope, fact.value_kind.value), []
+            ).append(fact)
         kept: List[AtomicFact] = []
         for members in grouped.values():
             values = {round(float(m.value), 6) for m in members if m.is_numeric}
@@ -1140,6 +1365,7 @@ class OrphanRowExtractor:
         periods: Sequence[ResolvedPeriod],
         unit: Optional[UnitSpec],
         stats: Dict[str, int],
+        column_units: Optional[Sequence[Optional[UnitSpec]]] = None,
     ) -> List[AtomicFact]:
         facts: List[AtomicFact] = []
         lines: List[Tuple[str, int, int]] = []
@@ -1151,19 +1377,56 @@ class OrphanRowExtractor:
         position = 0
         while position < len(lines):
             label_line, label_start, label_end = lines[position]
+            if _is_bullet_artifact(label_line):
+                # Some PDFs render a bullet point through a symbol font whose
+                # glyph table maps the bullet to an ordinary letter or control
+                # character — this document's bullets decode as "y" or "\x07".
+                # PyMuPDF is extracting exactly what the font declares; the fix
+                # belongs here, not in the parser.
+                position += 1
+                continue
             label = _clean_label(label_line)
             if not label or not _looks_like_label(label) or parse_number(label_line) is not None:
                 position += 1
                 continue
 
+            # A row label can span several physical lines ("Revenue from" /
+            # "Part Truck" / "Load Services"). Fold forward while the next line
+            # still reads as more label text, so the fact is attributed to the
+            # whole phrase rather than only whichever fragment sat directly
+            # above the first number.
+            label_parts = [label]
+            merge_probe = position + 1
+            while merge_probe < len(lines) and len(label_parts) < 6:
+                next_line, _next_start, _next_end = lines[merge_probe]
+                next_text = _clean_label(next_line)
+                if not next_text or not _looks_like_label(next_text) or parse_number(next_line) is not None:
+                    break
+                label_parts.append(next_text)
+                merge_probe += 1
+            label = " ".join(label_parts)
+
+            # A last part that is nothing but a bare scale word ("million",
+            # "crore") is a stray unit declaration that wrapped onto its own
+            # line, not part of the measure's name — pull it out as a unit
+            # hint instead of leaving "million" as the attribute.
+            row_unit = unit
+            scale_hint = _trailing_scale_word(label_parts)
+            if scale_hint is not None:
+                label = " ".join(label_parts[:-1]) or label
+                if row_unit is None:
+                    row_unit = scale_hint
+
             values: List[Tuple[Quantity, int, int]] = []
-            probe = position + 1
+            probe = merge_probe
             while probe < len(lines) and len(values) < len(periods):
                 candidate, start, end = lines[probe]
                 text = candidate.strip()
                 if not text:
                     break
-                quantity = parse_quantity(text, fallback_unit=unit)
+                offset = len(values)
+                slot_unit = column_units[offset] if column_units and offset < len(column_units) else None
+                quantity = parse_quantity(text, fallback_unit=slot_unit if slot_unit is not None else row_unit)
                 if quantity is None or _looks_like_label(text):
                     break
                 values.append((quantity, start, end))
@@ -1195,6 +1458,8 @@ class OrphanRowExtractor:
                 stats["orphan_rows"] += 1
                 for offset, (quantity, start, end) in enumerate(values):
                     period = periods[offset]
+                    slot_unit = column_units[offset] if column_units and offset < len(column_units) else None
+                    value_unit = quantity.unit or slot_unit or row_unit
                     anchor = anchor_at(
                         page,
                         file_id=context.file_id,
@@ -1204,30 +1469,33 @@ class OrphanRowExtractor:
                     )
                     if anchor is None:
                         continue
+                    qualifiers = {
+                        key: value
+                        for key, value in {
+                            "binding": "inferred from column order — table borders absent",
+                            "column": period.source_text,
+                            "context": context.heading_before(page.page_number, block.char_start),
+                        }.items()
+                        if value
+                    }
+                    if slot_unit is not None and slot_unit.dimension is Dimension.PERCENT:
+                        qualifiers["value_type"] = "share of total"
                     facts.append(
                         AtomicFact(
                             entity=context.subject,
                             attribute=label,
                             value=quantity.value,
-                            unit=unit.describe() if unit else None,
+                            unit=value_unit.describe() if value_unit else None,
                             temporal_scope=period.label,
                             raw_statement=collapse_whitespace(
                                 f"{label}: {quantity.raw} ({period.source_text})"
                             ),
                             provenance=anchor,
                             confidence=0.55,
-                            value_kind=_value_kind(unit),
+                            value_kind=_value_kind(value_unit),
                             normalized_value=quantity.canonical_value,
-                            normalized_unit=(unit.currency or unit.canonical) if unit else None,
-                            qualifiers={
-                                key: value
-                                for key, value in {
-                                    "binding": "inferred from column order — table borders absent",
-                                    "column": period.source_text,
-                                    "context": context.heading_before(page.page_number, block.char_start),
-                                }.items()
-                                if value
-                            },
+                            normalized_unit=(value_unit.currency or value_unit.canonical) if value_unit else None,
+                            qualifiers=qualifiers,
                             extractor=self.name,
                         )
                     )
@@ -1251,7 +1519,7 @@ _VALUE_PATTERN = (
     r"trillion|days|tonnes|tons|mn tons|sq\.? ?ft\.?)?)"
 )
 _PROSE_RE = re.compile(
-    rf"(?P<attr>[A-Za-z][A-Za-z0-9 ,'’\-\(\)/&\.]{{4,90}}?)\s+{_VERB_PATTERN}\s+{_VALUE_PATTERN}(?![\w.])",
+    rf"(?P<attr>[A-Za-z][A-Za-z0-9 ,'’\-\(\)/&\.]{{4,90}}?)\s+{_VERB_PATTERN}\s+{_VALUE_PATTERN}(?![\w.\-])",
     re.I,
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;])\s+(?=[A-Z0-9₹])")
@@ -1283,6 +1551,42 @@ def extract_period_label(text: str) -> Optional[str]:
     return collapse_whitespace(match.group(0)) if match else None
 
 
+def nearest_period_label(sentence: str, start: int, end: int, *, window: int = 120) -> Optional[str]:
+    """The period expression closest to a specific match, not just the first in the sentence.
+
+    A long sentence can legitimately name more than one year — a statute's
+    enactment year, a regulation, and the year the fact actually happened
+    ("...allotted equity shares after expiry of 60 days ... and violated the
+    Foreign Exchange Management Act, 1999"). The value here is "60 days"; 1999
+    is a citation over a hundred characters away. Taking whichever period
+    appears first in the sentence binds facts to statute years, filing years,
+    and other incidental dates that have nothing to do with the claim. This
+    looks in a window immediately around the match and only widens to the
+    whole sentence — preserving the old behaviour — when nothing is close by.
+    """
+    lo, hi = max(0, start - window), min(len(sentence), end + window)
+    before = list(_PERIOD_TOKEN_RE.finditer(sentence[lo:start]))
+    after = _PERIOD_TOKEN_RE.search(sentence[end:hi])
+
+    candidates: List[Tuple[int, str]] = []
+    if before:
+        closest_before = before[-1]
+        distance = start - (lo + closest_before.end())
+        candidates.append((distance, collapse_whitespace(closest_before.group(0))))
+    if after:
+        candidates.append((after.start(), collapse_whitespace(after.group(0))))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    # Deliberately no whole-sentence fallback here. A period far outside the
+    # window is exactly the failure this function exists to avoid — a statute
+    # year or an unrelated citation elsewhere in a long sentence is not this
+    # claim's period, and a fact with no defensible period should be dropped,
+    # not guessed.
+    return None
+
+
 #: Function words a regex sweeps up in front of the real attribute.
 _ATTRIBUTE_LEAD_WORDS = {
     "in", "as", "of", "and", "or", "but", "each", "from", "with", "to", "for",
@@ -1291,9 +1595,31 @@ _ATTRIBUTE_LEAD_WORDS = {
     "however", "although", "though", "since", "when", "than", "then", "also",
     "against", "about", "into", "over", "under", "per", "was", "were", "is",
     "are", "been", "being", "had", "has", "have",
+    "still", "meanwhile", "moreover", "furthermore", "notably", "importantly",
+    "similarly", "conversely", "additionally", "accordingly", "thus",
+    "therefore", "nevertheless", "nonetheless", "following", "consequently",
+    "given", "amid", "amidst", "despite", "besides", "hence", "so",
+}
+
+#: Auxiliary/helper verbs left dangling at the end of a captured attribute when
+#: the matched reporting verb is a two-word phrase ("has declined to" — the
+#: regex matches only "declined to", leaving "has" stuck to the attribute).
+_TRAILING_AUXILIARY_WORDS = {
+    "has", "have", "had", "is", "are", "was", "were", "be", "been", "being",
+    "will", "would", "can", "could", "should", "shall", "may", "might",
+    "must", "did", "do", "does",
 }
 
 _ATTRIBUTE_NUMBER_RE = re.compile(r"\d[\d,]{2,}|\b(?:19|20)\d{2}\b|\b(?:FY|CY|Q[1-4])\s?\d{2,4}\b", )
+
+#: Pronouns that refer to a specific, unnamed third party — never to the
+#: document's own subject. "its total revenue" almost always means the
+#: document's subject's revenue, so stripping "its" and defaulting to that
+#: subject is correct; "he received a compensation of ₹X" refers to whichever
+#: named director's biography the sentence sits in, which this system cannot
+#: resolve. Attributing that fact to the document subject would be wrong, not
+#: just untidy, so these are rejected outright rather than cleaned up.
+_UNRESOLVED_PRONOUN_SUBJECTS = {"he", "she", "him", "her", "himself", "herself"}
 
 
 def clean_attribute_phrase(text: str) -> Optional[str]:
@@ -1307,9 +1633,44 @@ def clean_attribute_phrase(text: str) -> Optional[str]:
     grounded in real text yet describe nothing. Those are rejected outright.
     """
     words = collapse_whitespace(text).split()
-    while words and words[0].strip(",;:").casefold() in _ATTRIBUTE_LEAD_WORDS:
+    words = _LIST_MARKER_RE.sub("", " ".join(words)).split()
+    while words and (
+        words[0].strip(",;:").casefold() in _ATTRIBUTE_LEAD_WORDS
+        or _is_bullet_artifact(words[0])
+    ):
         words.pop(0)
     phrase = " ".join(words).strip(" ,;:.-")
+
+    # A prefatory clause ("Under staff's baseline scenario, real GDP growth")
+    # leaves its trailing half as the only part that is actually a measure
+    # name. A comma inside a genuine attribute is otherwise vanishingly rare
+    # in financial and macro text, so preferring the segment after the last
+    # comma is safe and fixes this whole class of capture in one place.
+    if "," in phrase:
+        tail = phrase.rsplit(",", 1)[1].strip(" ,;:.-")
+        tail_tokens = tail.split()
+        while tail_tokens and tail_tokens[0].strip(",;:").casefold() in _ATTRIBUTE_LEAD_WORDS:
+            tail_tokens.pop(0)
+        tail = " ".join(tail_tokens)
+        if len(tail.split()) >= 2:
+            phrase = tail
+
+    # A trailing auxiliary verb ("Headline inflation has" — the regex matched
+    # only "declined to", leaving "has" stuck to the end of the attribute) is
+    # dropped the same way a leading one already is.
+    tail_words = phrase.split()
+    while tail_words and tail_words[-1].strip(",;:.").casefold() in _TRAILING_AUXILIARY_WORDS:
+        tail_words.pop()
+    phrase = " ".join(tail_words)
+
+    # Checked last, on the fully-cleaned phrase, because the pronoun is often
+    # only exposed after the comma-split above runs — "In Fiscal 2021, he
+    # received..." only becomes "he received..." once the prefatory clause is
+    # already gone.
+    leading_word = phrase.split()[0].strip(",;:").casefold() if phrase else ""
+    if leading_word in _UNRESOLVED_PRONOUN_SUBJECTS:
+        return None
+
     if len(phrase) < 6 or len(phrase) > 60:
         return None
     if len(phrase.split()) < 2:
@@ -1352,11 +1713,11 @@ class ProseFactExtractor:
             block = classified.block
             for sentence, sentence_start in self._sentences(block):
                 stats["prose_sentences"] += 1
-                period_label = extract_period_label(sentence)
-                if period_label is None:
-                    stats["prose_rejected_no_period"] += 1
-                    continue
                 for match in _PROSE_RE.finditer(sentence):
+                    period_label = nearest_period_label(sentence, match.start(), match.end())
+                    if period_label is None:
+                        stats["prose_rejected_no_period"] += 1
+                        continue
                     attribute = clean_attribute_phrase(match.group("attr"))
                     if attribute is None:
                         stats["prose_rejected_bad_attribute"] = (
