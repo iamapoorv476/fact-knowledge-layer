@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import itertools
 import re
+import statistics
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -225,13 +226,31 @@ class EntityResolver:
 #: Words that qualify *how* something is measured. Two facts whose cores agree
 #: but whose modifiers differ are the classic apparent contradiction: same
 #: subject, same period, different definition.
+#: Words denoting an alternate computation or presentation basis of the SAME
+#: underlying measure — "Adjusted EBITDA" and "EBITDA" are two ways of
+#: computing one thing, so stripping the qualifier and comparing what's left
+#: is exactly right; a modifier difference is the reconciler's signal for
+#: APPARENT_CONTRADICTION-by-definition.
 _MODIFIER_TOKENS = {
     "adjusted", "adj", "reported", "restated", "normalised", "normalized",
-    "consolidated", "standalone", "total", "net", "gross", "service", "segment",
-    "proforma", "pro", "forma", "underlying", "excluding", "including", "incl",
-    "excl", "annualised", "annualized", "average", "estimated", "projected",
-    "provisional", "revised", "budgeted", "actual", "current", "noncurrent",
-    "other", "others",
+    "consolidated", "standalone", "proforma", "pro", "forma", "underlying",
+    "excluding", "including", "incl", "excl", "annualised", "annualized",
+    "average", "estimated", "projected", "provisional", "revised", "budgeted",
+    "actual",
+}
+#: Words that instead denote a STRUCTURAL, part-whole relationship — "Total X"
+#: is the sum X is a component of; "Other X" is the residual after named
+#: components are removed; "Current X" and "Noncurrent X" partition X into
+#: disjoint pieces. Stripping these as if they were mere presentation
+#: variants collapses genuinely distinct line items into one core: "Other
+#: income" and "Total income" both reduce to bare "income" and get compared
+#: as if they were the same figure at different precision, when one is a
+#: component and the other is the sum that component feeds into. These stay
+#: in the core, so "other income" and "total income" get different cores and
+#: are never mistaken for each other.
+_STRUCTURAL_WORDS = {
+    "total", "totals", "net", "gross", "other", "others", "current",
+    "noncurrent", "service", "segment",
 }
 _ATTRIBUTE_STOPWORDS = {
     "the", "a", "an", "of", "from", "for", "in", "on", "at", "to", "and", "or",
@@ -297,26 +316,35 @@ def profile_documents(
 ) -> Dict[str, DocumentProfile]:
     """Derive a per-document profile, including its data vintage.
 
-    Vintage is the latest period any fact in the document refers to. Two reports
-    that disagree about the same year often differ simply because one was
-    written later and had the revised number — that is a reconciliation, not a
-    contradiction, and this is the cheapest available proxy for it.
+    Vintage is the median period year any fact in the document refers to —
+    not the max. A report that mostly discusses the last two years but
+    includes one long-range forecast table (a decade of projections) would
+    have its estimated vintage dragged years into the future by that single
+    table if the max were used; the median stays anchored to what the
+    document is actually mostly about. Two reports that disagree on the same
+    measure often differ simply because one was written later and had the
+    revised number — that is a reconciliation, not a contradiction, and this
+    is the cheapest available proxy for it, since neither of these PDFs'
+    metadata carries a usable publication date.
     """
-    latest: Dict[str, int] = {}
+    years_by_file: Dict[str, List[int]] = {}
     filenames: Dict[str, str] = {}
     for fact in facts:
         file_id = fact.provenance.file_id
         filenames.setdefault(file_id, fact.provenance.document_name or file_id)
         year = fact.scope.year
         if year and 1900 < year < 2200:
-            latest[file_id] = max(latest.get(file_id, 0), year)
+            years_by_file.setdefault(file_id, []).append(year)
+    vintage: Dict[str, int] = {
+        file_id: round(statistics.median(years)) for file_id, years in years_by_file.items()
+    }
     profiles: Dict[str, DocumentProfile] = {}
     for file_id, name in filenames.items():
         profiles[file_id] = DocumentProfile(
             file_id=file_id,
             filename=(names or {}).get(file_id, name),
             subject=(subjects or {}).get(file_id, ""),
-            vintage_year=latest.get(file_id),
+            vintage_year=vintage.get(file_id),
         )
     return profiles
 

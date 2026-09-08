@@ -124,6 +124,13 @@ _DMY_RE = re.compile(
 )
 _MDY_RE = re.compile(r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b", re.I)
 _BARE_YEAR_RE = re.compile(r"\b(19|20)(\d{2})\b")
+#: "2024-25", "2023/24" — the fiscal-year-range notation Indian budget and
+#: national-accounts tables use constantly, almost never with an explicit "FY"
+#: prefix. Without this, "2024-25" falls all the way through to the bare-year
+#: fallback, loses the "-25" entirely, and is typed CALENDAR_YEAR — so it can
+#: never compare equal to "FY2024/25" from a document that did write "FY",
+#: even though both almost certainly mean the same reporting year.
+_FISCAL_YEAR_RANGE_RE = re.compile(r"\b(19|20)(\d{2})[-/](\d{2})\b")
 
 
 def _expand_year(raw: Optional[str]) -> Optional[int]:
@@ -134,6 +141,41 @@ def _expand_year(raw: Optional[str]) -> Optional[int]:
     if value < 100:
         return 2000 + value if value < 80 else 1900 + value
     return value
+
+
+def find_all_dates(text: str) -> List[date]:
+    """Every explicit day-month-year date in a text, in the order found.
+
+    Reuses the same patterns ``TemporalScope._parse_date`` matches against a
+    single string, but scans the whole text for every occurrence rather than
+    stopping at the first. Used to estimate a document's real publication
+    date from its own front matter and press-release language — a signal
+    that generalizes across any report stating its own release date, not
+    something specific to one document or corpus.
+    """
+    found: List[date] = []
+    for match in _ISO_DATE_RE.finditer(text):
+        try:
+            found.append(date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
+        except ValueError:
+            continue
+    for match in _DMY_RE.finditer(text):
+        month = _MONTHS.get(match.group(2)[:4].casefold().rstrip(".")) or _MONTHS.get(
+            match.group(2)[:3].casefold()
+        )
+        if month:
+            try:
+                found.append(date(int(match.group(3)), month, int(match.group(1))))
+            except ValueError:
+                continue
+    for match in _MDY_RE.finditer(text):
+        month = _MONTHS.get(match.group(1)[:3].casefold())
+        if month:
+            try:
+                found.append(date(int(match.group(3)), month, int(match.group(2))))
+            except ValueError:
+                continue
+    return found
 
 
 class TemporalScope(BaseModel):
@@ -216,6 +258,16 @@ class TemporalScope(BaseModel):
             return cls(raw=text, period_type=PeriodType.FISCAL_YEAR, year=fy_year)
         if cy_year is not None:
             return cls(raw=text, period_type=PeriodType.CALENDAR_YEAR, year=cy_year)
+
+        m = _FISCAL_YEAR_RANGE_RE.search(text)
+        if m:
+            start_year = int(m.group(1) + m.group(2))
+            end_suffix = int(m.group(3))
+            if end_suffix == (start_year + 1) % 100:
+                # Anchored at the starting year, matching how "FY2024/25"
+                # already resolves via _FY_RE above — so the two notations
+                # land on the identical canonical period and can be compared.
+                return cls(raw=text, period_type=PeriodType.FISCAL_YEAR, year=start_year)
 
         m = _BARE_YEAR_RE.search(text)
         if m:
@@ -782,6 +834,7 @@ __all__ = [
     "FactValue",
     "normalize_key",
     "collapse_whitespace",
+    "find_all_dates",
     "PeriodType",
     "TemporalScope",
     "MatchStrategy",

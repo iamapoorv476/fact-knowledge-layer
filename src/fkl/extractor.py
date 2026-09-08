@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -243,9 +243,14 @@ def classify_block(block: PageBlock, page_number: int, *, running_texts: Optiona
         and "\n" not in stripped
         and not stripped.endswith((".", ":", ";"))
         and not any(ch.isdigit() for ch in stripped)
+        and (stripped[0].isupper() or not stripped[0].isalpha())
     ):
         # A short line carrying digits is a fact-bearing fragment, not a title —
         # PDFs of dense reports split such lines into their own blocks constantly.
+        # A short line starting lowercase ("into account these factors, real GDP
+        # growth for") is the same phenomenon in prose rather than numbers: a
+        # sentence fragment cut off by the layout detector, not a heading —
+        # real headings are always Title Case or Sentence Case.
         return out(BlockRole.HEADING, "short single line, no digits")
     return out(BlockRole.PROSE, "default prose block")
 
@@ -481,6 +486,7 @@ class ExtractionContext:
     unit_context: UnitContext
     periods: PeriodResolver
     classified: Dict[int, List[ClassifiedBlock]] = field(default_factory=dict)
+    country_context: Optional[str] = None
 
     @property
     def file_id(self) -> str:
@@ -636,6 +642,26 @@ def infer_subject(document: ParsedDocument) -> str:
     # token with no capitalised neighbour, so "Selling" in "Selling Shareholders"
     # and "Reserve" in "Reserve Bank" are excluded as parts of noun phrases,
     # while "India" in "India's exports" counts.
+    standalone = _dominant_standalone_noun(document)
+    if standalone is not None:
+        return standalone
+
+    title = document.metadata.get("title", "").strip()
+    if title and len(title) <= 80:
+        return collapse_whitespace(title)
+    return "Unknown subject"
+
+
+def _dominant_standalone_noun(document: ParsedDocument) -> Optional[str]:
+    """The most frequent proper noun that stands alone, not inside a longer name.
+
+    "Selling" in "Selling Shareholders" and "Reserve" in "Reserve Bank" are
+    excluded as parts of noun phrases; "India" in "India's exports" counts.
+    Used both as the fallback subject for documents with no named publisher,
+    and independently as the "country context" for macro indicators inside a
+    document whose primary subject is the publishing institution rather than
+    the country the indicator describes (see infer_country_context).
+    """
     counts: Dict[str, int] = {}
     display: Dict[str, str] = {}
     for page in document.pages:
@@ -655,16 +681,35 @@ def infer_subject(document: ParsedDocument) -> str:
                 continue
             counts[key] = counts.get(key, 0) + 1
             display.setdefault(key, token)
-    if counts:
-        head_key = max(counts.items(), key=lambda kv: kv[1])[0]
-        return display.get(head_key, head_key.title())
+    if not counts:
+        return None
+    head_key = max(counts.items(), key=lambda kv: kv[1])[0]
+    return display.get(head_key, head_key.title())
 
-    head_key = None
-    org_counts = {}
-    title = document.metadata.get("title", "").strip()
-    if title and len(title) <= 80:
-        return collapse_whitespace(title)
-    return "Unknown subject"
+
+#: Macroeconomic indicators are properties of a country's economy, never of
+#: whichever institution's report happens to state them — "GDP growth" in a
+#: central bank's annual report is no more a property of that bank than it is
+#: in an IMF country report. Domain-general vocabulary, not tied to any one
+#: country or corpus.
+_COUNTRY_LEVEL_INDICATOR_TOKENS = {
+    "gdp", "inflation", "cpi", "wpi", "deficit", "unemployment", "reserves",
+    "exports", "imports", "remittances", "gni", "forex", "rupee", "currency",
+    "trade", "poverty", "population", "literacy",
+}
+
+
+def infer_country_context(document: ParsedDocument) -> Optional[str]:
+    """The country a document's macro indicators describe, independent of its subject.
+
+    A central bank's annual report resolves its *primary* subject to the bank
+    itself (it repeats its own name constantly) — correctly, for its own
+    balance-sheet facts. But the same report also states economy-wide figures
+    (GDP growth, inflation) that belong to the country, not the bank. This
+    computes that second, independent signal so those specific facts can be
+    re-attributed, without disturbing the institution's own facts.
+    """
+    return _dominant_standalone_noun(document)
 
 
 def _organisation_names(text: str) -> List[str]:
@@ -732,12 +777,19 @@ def build_context(
     by_page: Dict[int, List[ClassifiedBlock]] = {}
     for item in classified:
         by_page.setdefault(item.page_number, []).append(item)
+    subject = subject_override or infer_subject(document)
+    country = infer_country_context(document)
+    # Only meaningful when it actually differs from the subject — if the
+    # document's subject already IS the country ("India" for the Economic
+    # Survey), there is nothing to re-attribute.
+    country_context = country if country and normalize_key(country) != normalize_key(subject) else None
     return ExtractionContext(
         document=document,
-        subject=subject_override or infer_subject(document),
+        subject=subject,
         unit_context=build_unit_context(document),
         periods=PeriodResolver(infer_fiscal_year_end_month(document)),
         classified=by_page,
+        country_context=country_context,
     )
 
 
@@ -1621,6 +1673,7 @@ _TRAILING_AUXILIARY_WORDS = {
     "will", "would", "can", "could", "should", "shall", "may", "might",
     "must", "did", "do", "does",
 }
+_TRAILING_PREPOSITIONS = {"for", "of", "in", "at", "during", "since", "from", "to"}
 
 _ATTRIBUTE_NUMBER_RE = re.compile(r"\d[\d,]{2,}|\b(?:19|20)\d{2}\b|\b(?:FY|CY|Q[1-4])\s?\d{2,4}\b", )
 
@@ -1675,6 +1728,21 @@ def clean_attribute_phrase(text: str) -> Optional[str]:
         tail_words.pop()
     phrase = " ".join(tail_words)
 
+    # "...real GDP growth for 2025-26" — the greedy attr capture can swallow
+    # the very period expression nearest_period_label already finds on its
+    # own. Left in, it trips the embedded-year rejection below for no reason;
+    # stripped, the attribute reads cleanly and the period is not lost, since
+    # it is found independently regardless of which side of the match it sits
+    # on. A dangling preposition ("growth for") left behind by the removal is
+    # trimmed the same way.
+    period_at_end = _PERIOD_TOKEN_RE.search(phrase)
+    if period_at_end is not None and period_at_end.end() == len(phrase):
+        phrase = phrase[: period_at_end.start()].strip(" ,;:.-")
+        tail_words = phrase.split()
+        while tail_words and tail_words[-1].casefold() in _TRAILING_PREPOSITIONS:
+            tail_words.pop()
+        phrase = " ".join(tail_words)
+
     # Checked last, on the fully-cleaned phrase, because the pronoun is often
     # only exposed after the comma-split above runs — "In Fiscal 2021, he
     # received..." only becomes "he received..." once the prefatory clause is
@@ -1719,94 +1787,155 @@ class ProseFactExtractor:
         facts: List[AtomicFact] = []
         stats: Dict[str, int] = {"prose_sentences": 0, "prose_rejected_no_unit": 0, "prose_rejected_no_period": 0}
 
-        for classified in context.blocks_on(page.page_number):
+        blocks = context.blocks_on(page.page_number)
+        for classified in blocks:
             if classified.role is not BlockRole.PROSE:
                 continue
-            block = classified.block
-            for sentence, sentence_start in self._sentences(block):
-                stats["prose_sentences"] += 1
-                for match in _PROSE_RE.finditer(sentence):
-                    period_label = nearest_period_label(sentence, match.start(), match.end())
-                    if period_label is None:
-                        stats["prose_rejected_no_period"] += 1
-                        continue
-                    attribute = clean_attribute_phrase(match.group("attr"))
-                    if attribute is None:
-                        stats["prose_rejected_bad_attribute"] = (
-                            stats.get("prose_rejected_bad_attribute", 0) + 1
-                        )
-                        continue
-                    entity, attribute = split_possessive_entity(attribute, context.subject)
-                    raw_value = match.group("value")
-                    inline_unit = parse_quantity(raw_value)
-                    if inline_unit is None:
-                        continue
-                    if inline_unit.unit is None and _is_bare_year(raw_value):
-                        # "the Act of 1999" is not ₹1,999 — a bare year with no
-                        # unit of its own is a date, and inheriting the page's
-                        # currency would turn every statutory reference into money.
-                        stats["prose_rejected_bare_year"] = (
-                            stats.get("prose_rejected_bare_year", 0) + 1
-                        )
-                        continue
-                    unit = inline_unit.unit
-                    if unit is None:
-                        resolved, source = context.unit_context.resolve(
-                            page.page_number, sentence_start + match.start()
-                        )
-                        # Same rule as the table path: a unit declared on this
-                        # page can be inherited, a document-wide default cannot.
-                        # Otherwise "the monthly injury rate stood at 0.20"
-                        # becomes ₹0.2 million because a note page said so.
-                        unit = resolved if source.startswith("page-declaration") else None
-                    if unit is None:
-                        stats["prose_rejected_no_unit"] += 1
-                        continue
-                    quantity = parse_quantity(raw_value, fallback_unit=unit)
-                    if quantity is None:
-                        continue
+            facts.extend(
+                self._extract_from_span(
+                    context, page, classified.block.text, classified.block.char_start, stats
+                )
+            )
 
-                    start = sentence_start + match.start()
-                    end = sentence_start + match.end()
-                    anchor = anchor_at(
-                        page,
-                        file_id=context.file_id,
-                        char_start=start,
-                        char_end=end,
-                        document_name=context.name,
-                    )
-                    if anchor is None:
-                        continue
-                    facts.append(
-                        AtomicFact(
-                            entity=entity,
-                            attribute=attribute,
-                            value=quantity.value,
-                            unit=unit.describe(),
-                            temporal_scope=period_label,
-                            raw_statement=collapse_whitespace(sentence)[:400],
-                            provenance=anchor,
-                            confidence=self.min_confidence + (0.1 if inline_unit.unit else 0.0),
-                            value_kind=_value_kind(unit),
-                            normalized_value=quantity.canonical_value,
-                            normalized_unit=(unit.currency or unit.canonical),
-                            qualifiers={"source": "prose"},
-                            extractor=self.name,
-                        )
-                    )
+        # Some PDFs (this RBI report's numbered-paragraph sections, for one)
+        # get layout-detected as a run of short one-line blocks instead of one
+        # paragraph block — "real GDP growth for" / "2025-26 is projected at
+        # 6.5 per cent" land in separate blocks, and a sentence split across
+        # blocks can never match _PROSE_RE, which only ever sees one block at
+        # a time. This second pass re-reads each run of consecutive PROSE
+        # blocks as one span, sliced straight from the page's own text so the
+        # offsets it finds are already correct page-absolute positions. Facts
+        # already found by the per-block pass above collapse via the pipeline's
+        # existing id-based dedup, so there is no double-counting.
+        for start_index, end_index in self._prose_runs(blocks):
+            if end_index - start_index < 2:
+                continue  # single-block runs are already covered above
+            span_start = blocks[start_index].block.char_start
+            span_end = blocks[end_index - 1].block.char_end
+            span_text = page.text[span_start:span_end]
+            facts.extend(self._extract_from_span(context, page, span_text, span_start, stats))
+
         return facts, stats
 
     @staticmethod
-    def _sentences(block: PageBlock) -> Iterable[Tuple[str, int]]:
-        text = block.text.replace("\n", " ")
+    def _prose_runs(blocks: Sequence["ClassifiedBlock"]) -> Iterator[Tuple[int, int]]:
+        """Yield (start, end) index ranges of consecutive PROSE-role blocks."""
+        run_start: Optional[int] = None
+        for index, item in enumerate(blocks):
+            if item.role is BlockRole.PROSE:
+                if run_start is None:
+                    run_start = index
+            else:
+                if run_start is not None:
+                    yield (run_start, index)
+                run_start = None
+        if run_start is not None:
+            yield (run_start, len(blocks))
+
+    def _extract_from_span(
+        self,
+        context: ExtractionContext,
+        page: ParsedPage,
+        text: str,
+        span_start: int,
+        stats: Dict[str, int],
+    ) -> List[AtomicFact]:
+        facts: List[AtomicFact] = []
+        for sentence, sentence_start in self._sentences_in_text(text, span_start):
+            stats["prose_sentences"] += 1
+            for match in _PROSE_RE.finditer(sentence):
+                # A period embedded in the attribute's own text ("...loss for
+                # FY24 stood at...") belongs to the same clause as this value
+                # and is more trustworthy than one found by proximity alone —
+                # a comparison clause later in the sentence ("...as against
+                # ₹8,123.02 million for FY23...") can sit physically closer
+                # to the match than the value's own period, and proximity
+                # search would wrongly prefer it. Check inside the attribute
+                # first; only fall back to the broader nearby search when the
+                # attribute carries no period of its own.
+                period_label = extract_period_label(match.group("attr"))
+                if period_label is None:
+                    period_label = nearest_period_label(sentence, match.start(), match.end())
+                if period_label is None:
+                    stats["prose_rejected_no_period"] += 1
+                    continue
+                attribute = clean_attribute_phrase(match.group("attr"))
+                if attribute is None:
+                    stats["prose_rejected_bad_attribute"] = (
+                        stats.get("prose_rejected_bad_attribute", 0) + 1
+                    )
+                    continue
+                entity, attribute = split_possessive_entity(attribute, context.subject)
+                raw_value = match.group("value")
+                inline_unit = parse_quantity(raw_value)
+                if inline_unit is None:
+                    continue
+                if inline_unit.unit is None and _is_bare_year(raw_value):
+                    # "the Act of 1999" is not ₹1,999 — a bare year with no
+                    # unit of its own is a date, and inheriting the page's
+                    # currency would turn every statutory reference into money.
+                    stats["prose_rejected_bare_year"] = (
+                        stats.get("prose_rejected_bare_year", 0) + 1
+                    )
+                    continue
+                unit = inline_unit.unit
+                if unit is None:
+                    resolved, source = context.unit_context.resolve(
+                        page.page_number, sentence_start + match.start()
+                    )
+                    # Same rule as the table path: a unit declared on this
+                    # page can be inherited, a document-wide default cannot.
+                    # Otherwise "the monthly injury rate stood at 0.20"
+                    # becomes ₹0.2 million because a note page said so.
+                    unit = resolved if source.startswith("page-declaration") else None
+                if unit is None:
+                    stats["prose_rejected_no_unit"] += 1
+                    continue
+                quantity = parse_quantity(raw_value, fallback_unit=unit)
+                if quantity is None:
+                    continue
+
+                start = sentence_start + match.start()
+                end = sentence_start + match.end()
+                anchor = anchor_at(
+                    page,
+                    file_id=context.file_id,
+                    char_start=start,
+                    char_end=end,
+                    document_name=context.name,
+                )
+                if anchor is None:
+                    continue
+                facts.append(
+                    AtomicFact(
+                        entity=entity,
+                        attribute=attribute,
+                        value=quantity.value,
+                        unit=unit.describe(),
+                        temporal_scope=period_label,
+                        raw_statement=collapse_whitespace(sentence)[:400],
+                        provenance=anchor,
+                        confidence=self.min_confidence + (0.1 if inline_unit.unit else 0.0),
+                        value_kind=_value_kind(unit),
+                        normalized_value=quantity.canonical_value,
+                        normalized_unit=(unit.currency or unit.canonical),
+                        qualifiers={"source": "prose"},
+                        extractor=self.name,
+                    )
+                )
+        return facts
+
+    @staticmethod
+    def _sentences_in_text(text: str, span_start: int) -> Iterable[Tuple[str, int]]:
+        flattened = text.replace("\n", " ")
         position = 0
-        for piece in _SENTENCE_SPLIT_RE.split(text):
-            index = text.find(piece, position)
+        for piece in _SENTENCE_SPLIT_RE.split(flattened):
+            index = flattened.find(piece, position)
             if index == -1:
                 index = position
             position = index + len(piece)
             if 20 < len(piece) <= 600:
-                yield piece, block.char_start + index
+                yield piece, span_start + index
             elif len(piece) > 600:
                 # A 2,000-character run with no sentence break is a table that
                 # lost its structure, not prose. Reading it as a sentence
@@ -2149,6 +2278,8 @@ class ExtractionPipeline:
         report.duplicates_collapsed = duplicates
         report.seconds = round(time.time() - started, 2)
         facts = sorted(collected.values(), key=lambda f: (f.provenance.page_number, f.provenance.char_start))
+        if context.country_context is not None:
+            facts = [self._reattribute_country_indicator(f, context) for f in facts]
         return ExtractionResult(facts=facts, report=report, context=context)
 
     # -- internals ---------------------------------------------------------- #
@@ -2194,6 +2325,23 @@ class ExtractionPipeline:
     def _merge_counters(report: ExtractionReport, stats: Dict[str, int]) -> None:
         for key, value in stats.items():
             report.counters[key] = report.counters.get(key, 0) + value
+
+    @staticmethod
+    def _reattribute_country_indicator(fact: AtomicFact, context: ExtractionContext) -> AtomicFact:
+        """Re-attribute a macro-indicator fact to the country it describes.
+
+        Only touches facts still carrying the document's own institutional
+        subject as their entity — a fact already given a different entity (a
+        possessive like "India's exports", or a table caption naming a
+        country) is left alone, since that is already more specific and more
+        directly evidenced than this document-wide fallback.
+        """
+        if normalize_key(fact.entity) != normalize_key(context.subject):
+            return fact
+        attribute_tokens = set(re.split(r"[^a-z0-9]+", fact.attribute.casefold()))
+        if not attribute_tokens & _COUNTRY_LEVEL_INDICATOR_TOKENS:
+            return fact
+        return AtomicFact(**{**fact.model_dump(), "entity": context.country_context, "id": ""})
 
     @staticmethod
     def _collect(
