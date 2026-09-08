@@ -80,12 +80,32 @@ def render_relationship_section(
 # --------------------------------------------------------------------------- #
 # Pipeline run
 # --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False)
+def parse_and_extract(file_bytes: bytes, filename: str):
+    """Parse and extract one PDF, cached by its exact bytes.
+
+    Table detection (PyMuPDF's find_tables()) is the dominant cost on
+    table-heavy documents and its speed varies a great deal between PyMuPDF
+    versions — this cache means that cost is only ever paid once per file,
+    not once per pipeline run. Re-uploading the same PDF (common while
+    testing different document pairings, or re-running for a demo) returns
+    instantly instead of reparsing from scratch.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        document = parse_pdf(tmp_path, filename=filename)
+        pipeline = ExtractionPipeline(use_llm=False)
+        return pipeline.run(document)
+    finally:
+        os.unlink(tmp_path)
+
+
 if run_clicked and uploaded_files:
     if len(uploaded_files) < 2:
         st.warning("Upload at least 2 PDFs — cross-document reconciliation needs more than one source.")
         st.stop()
-
-    pipeline = ExtractionPipeline(use_llm=False)
 
     all_facts: list[AtomicFact] = []
     subjects: dict[str, str] = {}
@@ -94,14 +114,10 @@ if run_clicked and uploaded_files:
     st.header("1 · Extraction")
     progress = st.progress(0.0)
     for index, uploaded in enumerate(uploaded_files):
-        with st.spinner(f"Parsing {uploaded.name}…"):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded.getvalue())
-                tmp_path = tmp.name
+        with st.spinner(f"Parsing {uploaded.name}… (cached instantly if you've processed this exact file before)"):
             try:
                 started = time.time()
-                document = parse_pdf(tmp_path, filename=uploaded.name)
-                result = pipeline.run(document)
+                result = parse_and_extract(uploaded.getvalue(), uploaded.name)
                 all_facts.extend(result.facts)
                 subjects[result.report.file_id] = result.report.subject
                 names[result.report.file_id] = uploaded.name
@@ -113,8 +129,6 @@ if run_clicked and uploaded_files:
                 )
             except Exception as exc:  # noqa: BLE001 — surface any failure to the UI rather than crashing silently
                 st.error(f"Failed to process {uploaded.name}: {exc}")
-            finally:
-                os.unlink(tmp_path)
         progress.progress((index + 1) / len(uploaded_files))
 
     if not all_facts:
